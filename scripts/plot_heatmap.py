@@ -3,13 +3,15 @@ import csv
 import sys
 
 import matplotlib
+import numpy as np
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402  (backend must be chosen first)
-import numpy as np  # noqa: E402
+matplotlib.use("Agg")  # headless backend; pyplot is imported inside main() after this
+
 
 
 def main(src: str, dst: str) -> None:
+    import matplotlib.pyplot as plt
+
     rows = list(csv.DictReader(open(src, newline="")))
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.2))
     for ax, bits, label in zip(axes, ("64", "4"), ("fp64 (8 B)", "packed int4 (0.5 B)")):
