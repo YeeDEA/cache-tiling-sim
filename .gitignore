@@ -1,0 +1,9 @@
+cachesim
+cachesim.exe
+cuda/matmul
+cuda/matmul.exe
+*.o
+*.obj
+*.exp
+*.lib
+__pycache__/
