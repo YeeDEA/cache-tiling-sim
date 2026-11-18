@@ -52,9 +52,15 @@ For `N = 4096` (`A`, `B`, `C` each `64 MB`, overflowing on-chip caches):
    - In `128x128 (TM=8, TN=8)`, `8 + 8 = 16` floats (`64 B`) read from SMEM feed `64` FMAs (`128` FLOPs) -> **`2.0 FLOP/B` out of SMEM** (8x compute intensity vs `matmul_tiled`).
    - Transposing `A` into `As[BK][BM + 1]` gives `stride = BM + 1` (`65` or `129`, both odd and coprime to `32` SMEM banks), which reduces bank conflicts on the staging stores along `k`. The `As` reads are warp-broadcast (a warp spans at most 2 distinct `ty`), while the `Bs` reads at stride `TN` across lanes may still conflict; confirm with Nsight Compute's shared-memory bank-conflict counters.
 
-### 2.2 Why `64x64 (4x4)` Beats `128x128 (8x8)` at `N = 2048`, and Flips at `N = 4096`
-- At `N = 2048`: `128x128` launches only `(2048/128)^2 = 256` thread blocks, so wave quantization and per-SM occupancy likely hurt it relative to `64x64` (not profiled) (`1024` blocks: **`2,948.9` vs `2,682.0 GFLOP/s`**).
-- At `N = 4096`: both tiles reach full SM occupancy (`1024` vs `4096` blocks), while `128x128` issues half as many global `A`/`B` tile reloads once matrices exceed L2, overtaking `64x64` (**`2,287.3` vs `1,318.4 GFLOP/s`**, `9.02x` over naive, `73.9%` of FP32 SIMT cuBLAS).
+### 2.2 `128x128 (8x8)` vs `64x64 (4x4)`
+- Measured on RTX 5050 Laptop, 3 back-to-back runs (`docs/results/nvrtc_bench_run*.log`): `128x128` wins at both sizes,
+  **`2,795–3,261` vs `2,319–2,508 GFLOP/s` at `N = 2048`** and **`3,570–3,622` vs `2,347–2,358` at `N = 4096`**
+  (`10.05x` over naive, `72.9%` of FP32 SIMT cuBLAS in run 3).
+- Why: per thread, 8x8 does 4x more FMAs per SMEM load than 4x4, and per block A/B tiles are reloaded half as often.
+  The margin grows at `N = 4096` (~1.5x vs ~1.3x) because those reloads then miss L2.
+- `128x128` launches only `256` blocks at `N = 2048`, so wave quantization could have hurt it; the measurements
+  show it does not dominate here. An earlier unlogged run had `64x64` ahead at `N = 2048`; it did not reproduce.
+  Occupancy, register count and spills are still unprofiled (Nsight Compute).
 
 ### 2.3 Non-Vacuous Verification (`run_nvrtc.py --selftest`)
 Both `N = 2048` and `N = 4096` are exact multiples of `128`, so boundary guards (`gr < n`, `gk < n`, `gc < n`) in `cuda/kernels.cuh` are never exercised during the `2048 / 4096` benchmark. `python run_nvrtc.py --selftest` tests unaligned sizes `N = 129` and `N = 255` across all 5 custom kernels against FP32 cuBLAS (`torch.backends.cuda.matmul.allow_tf32 = False`, `rel_err < 1e-3`).

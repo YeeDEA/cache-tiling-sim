@@ -21,10 +21,10 @@ def main(src: str, dst: str) -> None:
         grid = np.zeros((len(tiles), len(pads)))
         for r in sub:
             grid[tiles.index(int(r["tile"])), pads.index(int(r["pad"]))] = float(r["miss_rate"])
-        im = ax.imshow(np.log10(np.maximum(grid, 1e-4)), cmap="magma_r", aspect="auto")
+        im = ax.imshow(np.log10(np.maximum(grid, 1e-4)), cmap="magma_r", aspect="auto", vmin=-2, vmax=2)  # shared scale
         for i in range(len(tiles)):
             for j in range(len(pads)):
-                ax.text(j, i, f"{grid[i, j]:.3g}", ha="center", va="center", fontsize=7, color="tab:cyan")
+                ax.text(j, i, f"{grid[i, j]:.3g}", ha="center", va="center", fontsize=7, color="white" if grid[i, j] > 1 else "black")
         ax.set_xticks(range(len(pads)), pads)
         ax.set_yticks(range(len(tiles)), tiles)
         ax.set_xlabel("row padding (elements)")
