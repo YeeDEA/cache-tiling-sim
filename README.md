@@ -9,16 +9,16 @@ conflict**. It exists to answer one question with numbers: *why does loop tiling
 does it silently fail?*
 
 A companion **CUDA SGEMM suite** (`cuda/`) measures the same memory-hierarchy progression on real
-GPU hardware — from global-memory naive, to shared-memory tiling, to **2D register tiling**,
+GPU hardware ??from global-memory naive, to shared-memory tiling, to **2D register tiling**,
 benchmarked directly against **cuBLAS**.
 
 **Key results** (simulated 32 KB / 8-way / 64 B L1, `N = 256` fp64; RTX 5050 Laptop for CUDA):
 
 - **Power-of-two strides are the real enemy:** with `N = 256`, 87% of the naive loop's misses are *conflict* misses,
-  and tiles of 16–64 fail just as badly. Padding each row by 8 elements cuts misses **8.0x**; tiling on top of
+  and tiles of 16??4 fail just as badly. Padding each row by 8 elements cuts misses **8.0x**; tiling on top of
   that cuts another **13.9x** (16.9M -> 2.1M -> 152k, ~111x in total).
 - **The int4 `pad 8` cliff is a replacement-policy effect:** LRU/FIFO/PLRU stay at ~8.4% misses, random drops to 2.2%.
-- **CUDA:** a 2D register-tiled SGEMM reaches **~63–74% of cuBLAS FP32** (3259 / 3597 GFLOP/s at `N = 2048 / 4096` in the tabled run), with FP32 error
+- **CUDA:** a 2D register-tiled SGEMM reaches **~63??4% of cuBLAS FP32** (3259 / 3597 GFLOP/s at `N = 2048 / 4096` in the tabled run), with FP32 error
   `4.7e-06` vs an FP64 reference.
 
 ![tiled miss rate over tile size and padding, fp64 vs int4](docs/heatmap.png)
@@ -121,9 +121,9 @@ that `pad = 8` elements is only `4 B` at `int4` (less than a 64 B cache block), 
 
 ### Tile x padding map (figure at the top)
 
-At `fp64` the whole `pad = 0` column is black (29.8–50.6% for `T >= 16`): no tile size escapes the power-of-two
+At `fp64` the whole `pad = 0` column is black (29.8??0.6% for `T >= 16`): no tile size escapes the power-of-two
 aliasing, and any padding of 4+ elements makes `T = 32` the clear winner. At packed `int4` everything is small,
-but `pad = 8` (only 4 B) is visibly worse than its neighbours for `T = 8/16/32` — the same uneven-set effect as above.
+but `pad = 8` (only 4 B) is visibly worse than its neighbours for `T = 8/16/32` ??the same uneven-set effect as above.
 
 ### Is the int4 `pad 8` cliff an LRU artifact? (`make policy`)
 
@@ -148,7 +148,7 @@ Same `naive` access stream, `N = 256`, 32 KB / 8-way / 64 B, four replacement po
   pattern and random is worst (8.78%). LRU's failure mode is specifically a cyclic set just over capacity.
 - Padding by a full line (`--pad 128`) beats every policy change, so fixing the layout is still the answer.
 
-## GPU Companion (`cuda/`) — Measured on RTX 5050 Laptop GPU (`sm_120`)
+## GPU Companion (`cuda/`) ??Measured on RTX 5050 Laptop GPU (`sm_120`)
 
 `cuda/kernels.cuh` and `cuda/matmul.cu` extend the blocking experiment onto an actual GPU memory hierarchy
 (Global DRAM -> L2 -> Shared Memory -> Registers), adding a **2D register-tiled SGEMM** kernel with transposed,
@@ -176,7 +176,7 @@ Measured with `run_nvrtc.py` (median of 10 runs, `NVIDIA GeForce RTX 5050 Laptop
 | `cuBLAS (FP32 SIMT)` | 3.342 | 5140.7 | 8.40x | 100.0% | (reference) |
 | `cuBLAS (TF32 Tensor Core)` | 2.363 | 7269.9 | 11.88x | 141.4% | 5.25e-05 |
 
-### N = 4096 (A, B, C = 64 MB each — exceeds L2 working set)
+### N = 4096 (A, B, C = 64 MB each ??exceeds L2 working set)
 
 | kernel | time (ms) | GFLOP/s | vs naive | % of cuBLAS (FP32) | max rel err |
 |---|---|---|---|---|---|
@@ -189,8 +189,8 @@ Measured with `run_nvrtc.py` (median of 10 runs, `NVIDIA GeForce RTX 5050 Laptop
 | `cuBLAS (TF32 Tensor Core)` | 15.407 | 8920.8 | 24.91x | 180.8% | 5.90e-05 |
 
 Tables are run 3 of 3 back-to-back runs ([`docs/results/nvrtc_bench_run*.log`](docs/results/)). Including a fourth run
-([`nvrtc_bench_fp64ref.log`](docs/results/nvrtc_bench_fp64ref.log)), `reg_tiled 128x128` ranged 2795–3968 GFLOP/s at `N=2048`
-(laptop clocks; the 64x64/128x128 order never changed) but only 3570–3622 at `N=4096`. `make nvrtc-test` output: [`docs/results/nvrtc_selftest.log`](docs/results/nvrtc_selftest.log).
+([`nvrtc_bench_fp64ref.log`](docs/results/nvrtc_bench_fp64ref.log)), `reg_tiled 128x128` ranged 2795??968 GFLOP/s at `N=2048`
+(laptop clocks; the 64x64/128x128 order never changed) but only 3570??622 at `N=4096`. `make nvrtc-test` output: [`docs/results/nvrtc_selftest.log`](docs/results/nvrtc_selftest.log).
 The `nvcc` path (`make run`) was not run for these numbers (no CUDA Toolkit on the measuring machine).
 
 ### What the GPU numbers show
@@ -204,9 +204,9 @@ The `nvcc` path (`make run`) was not run for these numbers (no CUDA Toolkit on t
 
 Design notes (code walkthroughs, set-aliasing derivations, SMEM bank-conflict analysis): [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md).
 
-- **[`mac-array-dv`](https://github.com/YeeDEA/mac-array-dv)** — an output-stationary INT8 MAC array in SystemVerilog/UVM; its PEs keep partial sums in local registers the same way `matmul_reg_tiled` keeps `acc[TM][TN]` in thread registers.
-- **[`quantcliff`](https://github.com/YeeDEA/quantcliff)** — measures how LLM quantization moves models under an 8 GB VRAM limit on the same RTX 5050; the `--bits` sweep here is an L1-sized analogy of that capacity cliff, not the same effect.
-- **[`jetson-orin-llm`](https://github.com/YeeDEA/jetson-orin-llm)** — INT4/NF4 LLM deployment on Jetson Orin, the edge-side counterpart of the int4 experiments here.
+- **[`mac-array-dv`](https://github.com/YeeDEA/mac-array-dv)** ??an output-stationary INT8 MAC array in SystemVerilog/UVM; its PEs keep partial sums in local registers the same way `matmul_reg_tiled` keeps `acc[TM][TN]` in thread registers.
+- **[`quantcliff`](https://github.com/YeeDEA/quantcliff)** ??measures how LLM quantization moves models under an 8 GB VRAM limit on the same RTX 5050; the `--bits` sweep here is an L1-sized analogy of that capacity cliff, not the same effect.
+- **[`jetson-orin-llm`](https://github.com/YeeDEA/jetson-orin-llm)** ??INT4/NF4 LLM deployment on Jetson Orin, the edge-side counterpart of the int4 experiments here.
 
 ## Limitations
 
