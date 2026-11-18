@@ -12,6 +12,17 @@ A companion **CUDA SGEMM suite** (`cuda/`) measures the same memory-hierarchy pr
 GPU hardware — from global-memory naive, to shared-memory tiling, to **2D register tiling**,
 benchmarked directly against **cuBLAS**.
 
+**Key results** (simulated 32 KB / 8-way / 64 B L1, `N = 256` fp64; RTX 5050 Laptop for CUDA):
+
+- **Power-of-two strides are the real enemy:** with `N = 256`, 87% of the naive loop's misses are *conflict* misses,
+  and tiles of 16–64 fail just as badly. Padding each row by 8 elements cuts misses **8.0x**; tiling on top of
+  that cuts another **13.9x** (16.9M -> 2.1M -> 152k, ~111x in total).
+- **The int4 `pad 8` cliff is a replacement-policy effect:** LRU/FIFO/PLRU stay at ~8.4% misses, random drops to 2.2%.
+- **CUDA:** a 2D register-tiled SGEMM reaches **~63–74% of cuBLAS FP32** (3259 / 3597 GFLOP/s at `N = 2048 / 4096` in the tabled run), with FP32 error
+  `4.7e-06` vs an FP64 reference.
+
+![tiled miss rate over tile size and padding, fp64 vs int4](docs/heatmap.png)
+
 ## Build and run
 
 ```bash
@@ -68,8 +79,10 @@ Options: `--workload naive|ikj|tiled`, `--n`, `--tile`, `--pad` (row padding, in
 
 ### What the numbers show
 
-1. **Tiling works, but only if the tile actually stays resident.** Best tiled configuration
-   (tile 32, pad 8) has 111x fewer misses than the naive loop and AMAT drops from 51.3 to 1.44 cycles.
+1. **Tiling works, but only if the tile actually stays resident.** The 111x total (16.9M -> 152k misses,
+   AMAT 51.3 -> 1.44 cycles) is two separate effects: padding alone (`naive, pad 0` -> `pad 8`) gives **8.0x**
+   (16.9M -> 2.11M), and tiling on the padded layout (`naive pad 8` -> `tiled 32 pad 8`) gives **13.9x** (2.11M -> 152k).
+   Without padding, tiling gives nothing: `tiled 32, pad 0` is slightly *worse* than naive.
 2. **Power-of-two strides are a trap.** With `N = 256` doubles a row is 2 KB = 32 blocks, so walking a
    column of B touches only 2 of the 64 sets. `naive, pad 0` is 87% conflict misses (14.8M of 16.9M),
    and tiles of 16 and 32 fail for the same reason even though a 32x32 double tile (8 KB) fits easily in
@@ -106,9 +119,7 @@ and below (`0.162% -> 0.023%` at packed `int4`), so **the best tile size depends
 that `pad = 8` elements is only `4 B` at `int4` (less than a 64 B cache block), so the 256 column blocks land unevenly across the sets (some sets get 9 blocks for 8 ways, which thrashes under LRU) and pushes `naive` to `8.429%` (`2.79M` conflict misses); padding by a full cache line (`--pad 128` = `64 B`) drops
 `naive` `int4` misses down to `8,672` (`0.026%`, AMAT `1.026`), while `tiled 64` hits `7,734` (`0.023%`, AMAT `1.023`).
 
-### Tile x padding map
-
-![tiled miss rate over tile size and padding, fp64 vs int4](docs/heatmap.png)
+### Tile x padding map (figure at the top)
 
 At `fp64` the whole `pad = 0` column is black (29.8–50.6% for `T >= 16`): no tile size escapes the power-of-two
 aliasing, and any padding of 4+ elements makes `T = 32` the clear winner. At packed `int4` everything is small,
@@ -177,9 +188,9 @@ Measured with `run_nvrtc.py` (median of 10 runs, `NVIDIA GeForce RTX 5050 Laptop
 | `cuBLAS (FP32 SIMT)` | 27.854 | 4934.3 | 13.78x | 100.0% | (reference) |
 | `cuBLAS (TF32 Tensor Core)` | 15.407 | 8920.8 | 24.91x | 180.8% | 5.90e-05 |
 
-Tables are run 3 of 3 back-to-back runs ([`docs/results/nvrtc_bench_run*.log`](docs/results/)); across the three runs
-`reg_tiled 128x128` ranged 2795–3261 GFLOP/s at `N=2048` and 3570–3622 at `N=4096`, so N=2048 numbers vary by ~15%
-on this laptop, N=4096 by ~1.5%. `make nvrtc-test` output: [`docs/results/nvrtc_selftest.log`](docs/results/nvrtc_selftest.log).
+Tables are run 3 of 3 back-to-back runs ([`docs/results/nvrtc_bench_run*.log`](docs/results/)). Including a fourth run
+([`nvrtc_bench_fp64ref.log`](docs/results/nvrtc_bench_fp64ref.log)), `reg_tiled 128x128` ranged 2795–3968 GFLOP/s at `N=2048`
+(laptop clocks; the 64x64/128x128 order never changed) but only 3570–3622 at `N=4096`. `make nvrtc-test` output: [`docs/results/nvrtc_selftest.log`](docs/results/nvrtc_selftest.log).
 The `nvcc` path (`make run`) was not run for these numbers (no CUDA Toolkit on the measuring machine).
 
 ### What the GPU numbers show
@@ -187,34 +198,18 @@ The `nvcc` path (`make run`) was not run for these numbers (no CUDA Toolkit on t
 1. **Shared-memory tiling alone still hits a memory wall.** `tiled T=16` reaches only 1.4x over naive at `N=2048`: cutting DRAM traffic helps, but each thread still issues two shared-memory reads (`As[ty][k]`, `Bs[k][tx]`) per FMA (0.25 FLOP/byte out of SMEM). At `N=2048`, `T=32` (1024 threads/block) is consistently slower than `T=16` in all three runs (`746.8` vs `868.0 GFLOP/s`), plausibly lower occupancy (not profiled); at `N=4096`, where DRAM traffic dominates, the larger tile wins (`731.7` vs `648.9`).
 2. **Register tiling unlocks compute throughput.** Holding a 2D `TM x TN` accumulator tile in thread registers turns each `k`-step into an outer product (`regA[TM] x regB[TN]`). With `8+8` SMEM loads feeding `64` FMAs in `128x128 (8x8)`, SMEM read traffic per FLOP drops 8x, reaching **63.4% of cuBLAS FP32 SIMT at `N=2048`** and a **10.05x speedup over naive (72.9% of cuBLAS) at `N=4096`**.
 3. **Bigger register tile wins at both sizes.** `128x128 (8x8)` beats `64x64 (4x4)` in all three runs, by ~1.3x at `N=2048` and ~1.5x at `N=4096`. Each thread does 4x more FMAs per SMEM load and each block reloads A/B half as often; the gain is larger at `N=4096`, where those reloads miss L2. (An earlier, unlogged run had shown `64x64` ahead at `N=2048`; it did not reproduce, so that claim was removed.)
-4. **SIMT vs. Tensor Core precision.** Disabling TF32 isolates IEEE-754 FP32 SIMT throughput; enabling TF32 engages Blackwell Tensor Cores for another ~1.8x at `N=4096` (`8921 GFLOP/s`) at `5.90e-5` relative error. The custom kernels show `0.00e+00` error against cuBLAS FP32, i.e. bit-identical here; treat that as "same summation order on these inputs", not as a general guarantee.
+4. **SIMT vs. Tensor Core precision.** Disabling TF32 isolates IEEE-754 FP32 SIMT throughput; enabling TF32 engages Blackwell Tensor Cores for another ~1.8x at `N=4096` (`8921 GFLOP/s`) at `5.90e-5` relative error. The `0.00e+00` column means the custom kernels are bit-identical to cuBLAS FP32 on these inputs. To show this is not a broken check, the fourth run also compares against an independent **FP64** reference: every FP32 kernel *and* cuBLAS FP32 has the same max relative error (`3.46e-06` at `N=2048`, `4.74e-06` at `N=4096`), i.e. ordinary FP32 rounding with the same sequential-`k` FMA order; TF32 is `5.2e-05`/`5.6e-05`.
 
 ## Connection to companion repositories
 
-See [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md) for line-by-line code walkthroughs, set-aliasing derivations, SMEM bank-conflict analysis, and full study notes bridging these repositories:
+Design notes (code walkthroughs, set-aliasing derivations, SMEM bank-conflict analysis): [docs/DEEP_DIVE.md](docs/DEEP_DIVE.md).
 
-- **[`YeeDEA/mac-array-dv`](https://github.com/YeeDEA/mac-array-dv)** (SystemVerilog + UVM 1.2 output-stationary `4x4 / 8x8` INT8 MAC array, `57/57` regression, `12` SVA): Continues the pipeline-and-cache motivation noted in `mac-array-dv`'s README (originating from a 5-stage pipelined MIPS processor). Architecturally, an output-stationary PE array pins partial sums in PE accumulator registers just as `matmul_reg_tiled_impl` pins `acc[TM][TN]` in thread registers — shifting the bottleneck to external tile feeding (`cachesim`). Methodologically, `cuda/run_nvrtc.py --selftest` (`N=129, 255`) applies the same anti-vacuous-pass rule learned when auditing `mac-array-dv`'s `xsim dist` stimulus and assertion `A8`.
-- **[`YeeDEA/quantcliff`](https://github.com/YeeDEA/quantcliff)** & **[`YeeDEA/jetson-orin-llm`](https://github.com/YeeDEA/jetson-orin-llm)** (Quantized LLM behavior on **RTX 5050 8 GB** & `INT4/NF4` edge deployment): In `quantcliff`, shrinking `Qwen3-4B` from `bf16` (`7822 MiB`, `5.9 tok/s`) to `Q8_0` (`5414 MiB`, `57.8 tok/s`) removes 8 GB VRAM spillover for a ~`10x` speedup with flat accuracy (`78%`), mirrored on `Llama-3.1-8B` (`7818 MiB` `8.1 tok/s` -> `Q4_K_M` `5648 MiB` `46.9 tok/s`). The `--bits` sweep here illustrates the same capacity-cliff mechanism one level down, inside a 32 KB L1 (an analogy, not the same cliff): `64x64` thrashes at `fp64` (`2.357%` misses) and drops cleanly to `0.0425%` (`int8`) and `0.0227%` (packed `int4`).
+- **[`mac-array-dv`](https://github.com/YeeDEA/mac-array-dv)** — an output-stationary INT8 MAC array in SystemVerilog/UVM; its PEs keep partial sums in local registers the same way `matmul_reg_tiled` keeps `acc[TM][TN]` in thread registers.
+- **[`quantcliff`](https://github.com/YeeDEA/quantcliff)** — measures how LLM quantization moves models under an 8 GB VRAM limit on the same RTX 5050; the `--bits` sweep here is an L1-sized analogy of that capacity cliff, not the same effect.
+- **[`jetson-orin-llm`](https://github.com/YeeDEA/jetson-orin-llm)** — INT4/NF4 LLM deployment on Jetson Orin, the edge-side counterpart of the int4 experiments here.
 
 ## Limitations
 
 CPU simulator models a single cache level (write-back; LRU/FIFO/random/tree-PLRU) without hardware prefetching or TLB effects; absolute cycle counts depend on core microarchitecture, while 3C miss trends and stride aliasing hold generally. The simulator has not been cross-checked against `cachegrind` or real hardware counters.
 
-## Questions this repo should let you answer
-
-- Why does `naive, pad 0` have mostly conflict misses even though the working set fits?
-- What changes in the 3C breakdown when you pad the rows, and why?
-- Why is the best tile size not simply "the largest one that fits"?
-- How does shared-memory + register tiling on a GPU relate to cache blocking on a CPU?
-- Why does halving the element width change the best tile size?
-
-<details>
-<summary>Reference answers (toggle for review)</summary>
-
-1. **`naive, pad 0` conflict misses:** At `N=256` with `8 B` doubles, each row is `2048 B = 32` cache blocks. Walking down column `j` of `B` steps by `32` blocks, mapping every row strictly onto 2 of the 64 cache sets (`set s` and `set s+32`), overflowing 8 ways (`14.81M` conflict vs `2.09M` capacity misses).
-2. **Effect of padding (`pad=8`):** Shifting leading dimension from `256` (`32` blocks) to `264` (`33` blocks, odd) breaks the power-of-two modulus alignment so column accesses spread evenly across all 64 sets. Conflict misses drop from `14.81M -> 0` (`naive`) and `17.33M -> 7,056` (`tiled T=32`).
-3. **Largest tile != best tile:** On the CPU, footprint decides: a `64x64` fp64 tile is `32 KB` per matrix, so A/B/C overflow the 32 KB cache (`803k` misses vs `152k` for `T=32`). Aliasing matters too: with `pad 0`, every `T >= 16` fails regardless of size (heatmap). On the GPU the opposite happens here: the larger `128x128` register tile wins because it raises FLOPs per SMEM/L2 load.
-4. **CPU blocking vs. GPU shared + register tiling:** CPU cache blocking improves reuse in hardware-managed L1 caches, bounded by register allocation and stride aliasing; GPU kernels explicitly stage tiles in programmer-managed Shared Memory (reducing staging-store bank conflicts via `+1` padding) and must add explicit 2D **register tiling** so SMEM bandwidth doesn't replace DRAM as the bottleneck.
-5. **Halving element width (`--elem` / `--bits`):** Halving bits per element halves a `T x T` tile's byte footprint, shifting the capacity cliff upward (`64x64` thrashes at 8 B `fp64` `2.36%` misses, fits cleanly at $\le$ 4 B `0.162% -> 0.043%` at `int8`, and hits `0.023%` at packed `int4`), analogous to how `Q8_0` / `Q4_K_M` quantization moves `Qwen3-4B` (`5.9 -> 57.8 tok/s`) and `Llama-3.1-8B` inside the 8 GB RTX 5050 ceiling in `quantcliff`. Also notice that padding must scale relative to cache-line size (8 elements = 64 B at `fp64`, vs. only 4 B at `int4`).
-
-</details>
+Design questions with worked answers: [docs/QUESTIONS.md](docs/QUESTIONS.md).

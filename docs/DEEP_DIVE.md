@@ -1,4 +1,4 @@
-# Architecture Deep Dive & Study Notes
+# Design Notes
 
 Technical walkthrough of `cache-tiling-sim`, its memory-hierarchy derivations, and how it bridges the CPU pipeline, hardware accelerator RTL/DV, and quantized LLM deployment repositories under `github.com/YeeDEA`.
 

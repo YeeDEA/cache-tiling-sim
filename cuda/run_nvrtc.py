@@ -156,6 +156,9 @@ def run_suite(sizes):
     for n in sizes:
         print(f"\n=== N = {n} ===")
         A, B, C, ref = _make_inputs(n, seed=1)
+        # independent FP64 reference: shows the true FP32 rounding error, which the
+        # FP32-vs-cuBLAS column cannot (it is 0 when both use the same k order)
+        ref64 = torch.matmul(A.double(), B.double())
         flops = 2.0 * n * n * n
         results = []
 
@@ -176,7 +179,8 @@ def run_suite(sizes):
             med = statistics.median(times)
             gflops = flops / (med * 1e6)
             max_rel = ((C - ref).abs() / torch.clamp(ref.abs(), min=1.0)).max().item()
-            results.append((label, med, gflops, max_rel))
+            rel64 = ((C.double() - ref64).abs() / torch.clamp(ref64.abs(), min=1.0)).max().item()
+            results.append((label, med, gflops, max_rel, rel64))
             return gflops
 
         g_naive = None
@@ -194,9 +198,9 @@ def run_suite(sizes):
         bench("cuBLAS (TF32 TC)", lambda: torch.matmul(A, B, out=C))
         torch.backends.cuda.matmul.allow_tf32 = False
 
-        print(f"{'kernel':<24} {'ms':>8} {'GFLOP/s':>10} {'vs naive':>9} {'%cuBLAS':>9} {'rel_err':>10}")
-        for label, med, gflops, rel in results:
-            print(f"{label:<24} {med:8.3f} {gflops:10.1f} {gflops / g_naive:8.2f}x {100.0 * gflops / g_cublas_fp32:8.1f}% {rel:10.2e}")
+        print(f"{'kernel':<24} {'ms':>8} {'GFLOP/s':>10} {'vs naive':>9} {'%cuBLAS':>9} {'rel_err':>10} {'err_fp64':>10}")
+        for label, med, gflops, rel, rel64 in results:
+            print(f"{label:<24} {med:8.3f} {gflops:10.1f} {gflops / g_naive:8.2f}x {100.0 * gflops / g_cublas_fp32:8.1f}% {rel:10.2e} {rel64:10.2e}")
 
 
 def run_selftest():
