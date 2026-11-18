@@ -17,7 +17,7 @@
 
 using u64 = uint64_t;
 
-// Unlike CHECK(), CHECK is never compiled out (-DNDEBUG), so --selftest cannot pass vacuously.
+// Unlike assert(), CHECK is never compiled out (-DNDEBUG), so --selftest cannot pass vacuously.
 #define CHECK(cond)                                                              \
     do {                                                                         \
         if (!(cond)) {                                                           \
@@ -64,27 +64,72 @@ static unsigned log2u(u64 x) {
     return r;
 }
 
-// Write-back, write-allocate, true-LRU set-associative cache.
+enum class Policy { LRU, FIFO, RANDOM, PLRU };
+
+static bool parse_policy(const std::string& s, Policy& p) {
+    if (s == "lru") p = Policy::LRU;
+    else if (s == "fifo") p = Policy::FIFO;
+    else if (s == "random") p = Policy::RANDOM;
+    else if (s == "plru") p = Policy::PLRU;
+    else return false;
+    return true;
+}
+
+// Write-back, write-allocate set-associative cache with selectable replacement
+// (true LRU, FIFO, random with a fixed seed, or tree pseudo-LRU).
+// The 3C classifier always uses a fully-associative *LRU* shadow, so for
+// non-LRU policies "conflict" means "a FA-LRU cache of equal size would have hit".
 class Cache {
     struct Line {
         bool valid = false, dirty = false;
-        u64 tag = 0, lru = 0;
+        u64 tag = 0, lru = 0, ins = 0;  // last-use tick, insertion tick
     };
     size_t sets_, assoc_;
-    unsigned off_bits_, idx_bits_;
+    unsigned off_bits_, idx_bits_, way_bits_;
+    Policy policy_;
     std::vector<Line> lines_;
-    u64 tick_ = 0;
+    std::vector<uint8_t> plru_;  // per set: assoc-1 tree bits (heap order, node 1 = root)
+    u64 tick_ = 0, rng_ = 0x9E3779B97F4A7C15ULL;
     FullyAssocLRU shadow_;
     std::unordered_set<u64> seen_;
     Stats st_;
 
+    u64 next_rand() {  // xorshift64: deterministic, so results are reproducible
+        rng_ ^= rng_ << 13;
+        rng_ ^= rng_ >> 7;
+        rng_ ^= rng_ << 17;
+        return rng_;
+    }
+    // Make every tree node on the path to way w point away from w.
+    void plru_touch(u64 set, size_t w) {
+        uint8_t* t = &plru_[set * assoc_];
+        size_t node = 1;
+        for (unsigned l = 0; l < way_bits_; ++l) {
+            const size_t bit = (w >> (way_bits_ - 1 - l)) & 1;
+            t[node] = uint8_t(!bit);
+            node = 2 * node + bit;
+        }
+    }
+    size_t plru_victim(u64 set) const {
+        const uint8_t* t = &plru_[set * assoc_];
+        size_t node = 1, w = 0;
+        for (unsigned l = 0; l < way_bits_; ++l) {
+            w = (w << 1) | t[node];
+            node = 2 * node + t[node];
+        }
+        return w;
+    }
+
 public:
-    Cache(size_t size, size_t assoc, size_t block)
+    Cache(size_t size, size_t assoc, size_t block, Policy policy = Policy::LRU)
         : sets_(size / (assoc * block)),
           assoc_(assoc),
           off_bits_(log2u(block)),
           idx_bits_(log2u(size / (assoc * block))),
+          way_bits_(log2u(assoc)),
+          policy_(policy),
           lines_((size / (assoc * block)) * assoc),
+          plru_((size / (assoc * block)) * assoc, 0),
           shadow_(size / block) {
         if (!is_pow2(size) || !is_pow2(assoc) || !is_pow2(block) || size < assoc * block) {
             std::fprintf(stderr, "size/assoc/block must be powers of two and size >= assoc*block\n");
@@ -105,6 +150,7 @@ public:
             if (base[w].valid && base[w].tag == tag) {
                 ++st_.hits;
                 base[w].lru = tick_;
+                if (policy_ == Policy::PLRU) plru_touch(set, w);
                 if (write) base[w].dirty = true;
                 return;
             }
@@ -127,10 +173,28 @@ public:
                 found_invalid = true;
                 break;
             }
-            if (base[w].lru < base[victim].lru) victim = w;
         }
-        if (!found_invalid && base[victim].dirty) ++st_.writebacks;
-        base[victim] = {true, write, tag, tick_};
+        if (!found_invalid) {
+            switch (policy_) {
+            case Policy::LRU:
+                for (size_t w = 1; w < assoc_; ++w)
+                    if (base[w].lru < base[victim].lru) victim = w;
+                break;
+            case Policy::FIFO:
+                for (size_t w = 1; w < assoc_; ++w)
+                    if (base[w].ins < base[victim].ins) victim = w;
+                break;
+            case Policy::RANDOM:
+                victim = size_t(next_rand() % assoc_);
+                break;
+            case Policy::PLRU:
+                victim = plru_victim(set);
+                break;
+            }
+            if (base[victim].dirty) ++st_.writebacks;
+        }
+        base[victim] = {true, write, tag, tick_, tick_};
+        if (policy_ == Policy::PLRU) plru_touch(set, victim);
     }
 
     void read(u64 a) { access(a, false); }
@@ -142,6 +206,7 @@ struct Config {
     size_t size = 32768, assoc = 8, block = 64;
     size_t n = 256, tile = 32, pad = 0, elem = 8, bits = 64;
     std::string workload = "naive", trace;
+    Policy policy = Policy::LRU;
     double hit_time = 1.0, penalty = 100.0;
     bool selftest = false, csv = false;
 };
@@ -269,6 +334,30 @@ static int selftest() {
         run_matmul(c, cfg);
         CHECK(c.stats().writes == 3ULL * 65ULL * 65ULL);
     }
+    {  // one 2-way set: 0,64,0,128,0. LRU evicts 64 (0 was reused) -> 0 hits;
+       // FIFO evicts 0 (inserted first) -> 0 misses. 2-way tree-PLRU == LRU.
+        const u64 seq[] = {0, 64, 0, 128, 0};
+        Cache lru(128, 2, 64, Policy::LRU), fifo(128, 2, 64, Policy::FIFO), plru(128, 2, 64, Policy::PLRU);
+        for (u64 a : seq) { lru.read(a); fifo.read(a); plru.read(a); }
+        CHECK(lru.stats().misses == 3 && fifo.stats().misses == 4 && plru.stats().misses == 3);
+    }
+    {  // 4-way tree-PLRU differs from true LRU. Fill ways 0..3 with 0,64,128,192, then hit 0.
+       // True LRU victim = way 1 (64). PLRU: touching way 0 points the root at ways 2/3, and
+       // node 3 still points at way 2 (way 3 was touched last) -> victim = way 2 (128).
+       // So the following access to 128 hits under LRU but misses under PLRU.
+        Cache p(256, 4, 64, Policy::PLRU), l(256, 4, 64, Policy::LRU);
+        const u64 seq[] = {0, 64, 128, 192, 0, 256, 128};
+        for (u64 a : seq) { p.read(a); l.read(a); }
+        CHECK(l.stats().misses == 5 && p.stats().misses == 6);
+    }
+    {  // cyclic access to assoc+1 blocks in one set: LRU and FIFO miss every time,
+       // random replacement keeps some blocks resident (fixed seed -> deterministic).
+        Cache l(256, 4, 64, Policy::LRU), f(256, 4, 64, Policy::FIFO), r(256, 4, 64, Policy::RANDOM);
+        for (int rep = 0; rep < 20; ++rep)
+            for (u64 b = 0; b < 5; ++b) { l.read(b * 256); f.read(b * 256); r.read(b * 256); }
+        CHECK(l.stats().misses == 100 && f.stats().misses == 100);
+        CHECK(r.stats().misses < 100 && r.stats().misses >= 5);
+    }
     std::puts("selftest passed");
     return 0;
 }
@@ -282,6 +371,7 @@ static void usage() {
         "  --bits B                     bits per element (64, 32, 16, 8, or 4=packed int4)\n"
         "  --size B --assoc W --block B cache bytes, ways, block bytes (32768 / 8 / 64)\n"
         "  --hit H --penalty P          hit time and miss penalty in cycles (1 / 100)\n"
+        "  --policy lru|fifo|random|plru replacement policy (default lru; random uses a fixed seed)\n"
         "  --trace FILE                 replay a trace (\"R 0x..\" / \"W 0x..\") instead of a workload\n"
         "  --csv                        one-line CSV output\n"
         "  --selftest                   run built-in sanity tests");
@@ -314,6 +404,13 @@ int main(int argc, char** argv) {
         else if (a == "--hit") cfg.hit_time = std::stod(next());
         else if (a == "--penalty") cfg.penalty = std::stod(next());
         else if (a == "--trace") cfg.trace = next();
+        else if (a == "--policy") {
+            const std::string p = next();
+            if (!parse_policy(p, cfg.policy)) {
+                std::fprintf(stderr, "unknown policy '%s' (lru|fifo|random|plru)\n", p.c_str());
+                return 2;
+            }
+        }
         else if (a == "--csv") cfg.csv = true;
         else if (a == "--selftest") cfg.selftest = true;
         else if (a == "--help" || a == "-h") { usage(); return 0; }
@@ -325,9 +422,13 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    Cache cache(cfg.size, cfg.assoc, cfg.block);
-    if (!cfg.trace.empty()) run_trace(cache, cfg.trace);
-    else run_matmul(cache, cfg);
+    Cache cache(cfg.size, cfg.assoc, cfg.block, cfg.policy);
+    if (!cfg.trace.empty()) {
+        run_trace(cache, cfg.trace);
+        cfg.workload = "trace";
+    } else {
+        run_matmul(cache, cfg);
+    }
 
     const Stats& s = cache.stats();
     const u64 total = s.reads + s.writes;

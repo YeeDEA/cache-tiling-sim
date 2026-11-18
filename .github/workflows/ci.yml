@@ -1,0 +1,26 @@
+name: ci
+on: [push, pull_request, workflow_dispatch]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build (warnings are errors)
+        run: make cachesim CXXFLAGS="-O2 -std=c++14 -Wall -Wextra -Werror"
+      - name: test
+        run: make test
+      - name: selftest also runs under -DNDEBUG
+        run: g++ -O2 -std=c++14 -DNDEBUG -o cachesim_ndebug src/cachesim.cpp && ./cachesim_ndebug --selftest
+      - name: experiments + policy comparison + heatmap
+        run: |
+          pip install matplotlib numpy
+          mkdir -p docs/results
+          make experiments | tee docs/results/cpu_experiments.md
+          make policy | tee docs/results/policy.md
+          make heatmap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: results
+          path: |
+            docs/results/
+            docs/heatmap.png
